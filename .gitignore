@@ -1,0 +1,23 @@
+# Extracted audio files — do not commit copyrighted game assets
+sounds/*.mp3
+sounds/*.wav
+sounds/*.ogg
+
+# Keep the sounds directory itself in the repo
+!sounds/.gitkeep
+
+# GDRE Tools output directory
+extraction/
+
+# Extraction script output directory
+merchant_voices/
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+
+# Debug screenshots
+debug_*.png
