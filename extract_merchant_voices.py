@@ -4,7 +4,9 @@ Slay the Spire 2 — Merchant Voice Extractor
 ============================================
 
 This script extracts the merchant's voice lines from Slay the Spire 2's game
-files so they can be used in a soundboard / cosplay project.
+files as standalone audio files. What you do with them afterwards (a
+soundboard, a cosplay prop, whatever) is outside this script's concern —
+it just handles extraction.
 
 It is designed to be run by someone who OWNS the game on Steam. It does NOT
 download anything illegal — it reads files you already have on your own machine.
@@ -12,7 +14,7 @@ download anything illegal — it reads files you already have on your own machin
 PREREQUISITES (install these first):
 ------------------------------------
 1. **GDRE Tools** — used to extract the Godot .pck file.
-   Download from: https://github.com/bruvzg/gdsdecomp/releases
+   Download from: https://github.com/GDRETools/gdsdecomp/releases
    After installing, make sure `gdre_tools` is on your PATH, or pass
    its location with --gdre-path.
 
@@ -40,16 +42,31 @@ USAGE:
 
 WHAT THE SCRIPT DOES (step by step):
 -------------------------------------
-  1. Finds the Steam install directory (Windows / Linux / macOS).
-  2. Locates "Slay the Spire 2.pck" inside the game folder.
-  3. Uses GDRE Tools to extract the .pck into a temporary extraction directory.
+  1. Finds the Steam install directory (Windows / Linux / macOS / WSL).
+  2. Locates the game's .pck file inside the game folder.
+  3. Uses GDRE Tools to extract just the FMOD bank files (res://banks/**/*.bank)
+     from the .pck into a temporary extraction directory — not a full project
+     recovery, which would needlessly decompile the whole game.
   4. Finds "sfx.bank" inside the extracted files (FMOD sound bank).
   5. Lists all subsongs in sfx.bank using vgmstream-cli.
-  6. Filters subsongs whose names contain "merchant".
+  6. Filters subsongs whose names contain "merchant" (case-insensitive).
   7. Decodes each merchant subsong to .wav using vgmstream-cli.
   8. If ffmpeg is available, converts each .wav to .mp3.
-  9. Saves everything to the output directory (default: merchant_voices/).
+  9. Saves the originally-named files to the output directory (default:
+     merchant_voices/) AND copies sequentially-numbered files
+     (merchant_01.mp3, merchant_02.mp3, ...) to the sounds directory
+     (default: sounds/) as a simple, generic naming scheme for downstream use.
  10. Prints a clear summary of what was extracted.
+
+WSL NOTE:
+---------
+If you're running this from WSL against a Windows Steam install (the game
+lives under /mnt/c/...), GDRE Tools' Linux build requires a newer glibc than
+some WSL distros ship (e.g. Ubuntu 20.04). If gdre_tools fails to run, download
+the *Windows* build of GDRE Tools instead and let WSL's interop run the .exe
+directly — this script detects that automatically and converts POSIX paths to
+Windows paths (via `wslpath`) when it detects the GDRE binary is a .exe.
+vgmstream-cli's native Linux build works fine under WSL without any of this.
 
 Author: Generated for StS2 Merchant Cosplay project
 """
@@ -93,6 +110,50 @@ def _supports_color() -> bool:
 
 
 _USE_COLOR = _supports_color()
+
+
+# ---------------------------------------------------------------------------
+# WSL helpers
+# ---------------------------------------------------------------------------
+
+def is_wsl() -> bool:
+    """
+    Detect whether we're running inside Windows Subsystem for Linux.
+
+    WSL reports platform.system() == "Linux", so we can't tell it apart from
+    a native Linux box that way. Instead we check /proc/version, which WSL
+    kernels annotate with "microsoft" or "WSL".
+    """
+    if platform.system() != "Linux":
+        return False
+    try:
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
+    except Exception:
+        return False
+
+
+def to_tool_path(path: Path, tool_path: str) -> str:
+    """
+    Convert a POSIX path to the path format the given external tool expects.
+
+    Under WSL, if the tool is a Windows binary (.exe) run via WSL interop, it
+    has no concept of /mnt/c/... POSIX paths or WSL UNC paths passed as
+    POSIX-style strings — it needs a real Windows path (e.g. "C:\\Users\\...").
+    We use `wslpath -w` to do that conversion. For native Linux/Mac tools
+    (the common case), the path is returned unchanged.
+    """
+    if is_wsl() and tool_path.lower().endswith(".exe"):
+        try:
+            result = subprocess.run(
+                ["wslpath", "-w", str(path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+    return str(path)
 
 
 def _c(text: str, color: str) -> str:
@@ -185,6 +246,16 @@ def get_candidate_steam_paths() -> List[Path]:
         for drive in ["D", "E", "F"]:
             candidates.append(Path(f"/mnt/{drive.lower()}/Steam"))
             candidates.append(Path(f"/media/{drive.lower()}/Steam"))
+
+        if is_wsl():
+            # Under WSL, Steam is very commonly the *Windows* install,
+            # reachable through the /mnt/<drive>/ passthrough mount rather
+            # than a native Linux Steam install.
+            for drive in ["c", "d", "e", "f"]:
+                candidates.append(Path(f"/mnt/{drive}/Program Files (x86)/Steam"))
+                candidates.append(Path(f"/mnt/{drive}/Program Files/Steam"))
+                candidates.append(Path(f"/mnt/{drive}/SteamLibrary"))
+                candidates.append(Path(f"/mnt/{drive}/Steam"))
 
     elif system == "Darwin":  # macOS
         candidates.append(Path.home() / "Library/Application Support/Steam")
@@ -314,12 +385,14 @@ def find_pck_file(game_path: Path) -> Optional[Path]:
     The .pck file is Godot's packed resource archive. For StS2 it sits at
     the root of the game install directory.
     """
-    # Primary expected location
-    pck_path = game_path / "Slay the Spire 2.pck"
-    if pck_path.exists():
-        size_mb = pck_path.stat().st_size / (1024 * 1024)
-        success(f"Found .pck file: {pck_path} ({size_mb:.1f} MB)")
-        return pck_path
+    # Try known filenames — the game's actual .pck is "SlayTheSpire2.pck"
+    # (no spaces), but check the spaced variant too in case it changes.
+    for candidate_name in ("SlayTheSpire2.pck", "Slay the Spire 2.pck"):
+        pck_path = game_path / candidate_name
+        if pck_path.exists():
+            size_mb = pck_path.stat().st_size / (1024 * 1024)
+            success(f"Found .pck file: {pck_path} ({size_mb:.1f} MB)")
+            return pck_path
 
     # Fallback: search for any .pck file in the game directory
     pck_files = list(game_path.glob("*.pck"))
@@ -380,23 +453,34 @@ def find_tool(name: str, explicit_path: Optional[str] = None) -> Optional[str]:
 
 def extract_pck(gdre_path: str, pck_path: Path, output_dir: Path) -> bool:
     """
-    Extract the Godot .pck file using GDRE Tools.
+    Extract just the FMOD bank files out of the Godot .pck using GDRE Tools.
 
     Command used:
-        gdre_tools --headless --recover="<pck_path>" --output-dir=<output_dir>
+        gdre_tools --headless --extract="<pck_path>" --output=<output_dir> \\
+            --include=res://banks/**/*.bank
 
-    GDRE Tools (Godot RE Tools) can unpack Godot 4 .pck files, which contain
-    all the game's resources — including the FMOD sound banks we need.
+    We deliberately use `--extract` with a narrow --include glob rather than
+    `--recover` (full project recovery). --recover decompiles every GDScript
+    file and converts every resource in the game back to source form, which
+    is slow and entirely unnecessary — we only need the raw .bank files.
+
+    GDRE Tools' actual output flag is `--output=<dir>`, not `--output-dir=`,
+    and it has no --headless-only main command named "recover" that just
+    dumps raw files — that's what --extract is for.
 
     Returns True on success, False on failure.
     """
-    step("Extracting .pck file with GDRE Tools...")
+    step("Extracting FMOD bank files with GDRE Tools...")
+
+    pck_arg = to_tool_path(pck_path, gdre_path)
+    output_arg = to_tool_path(output_dir, gdre_path)
 
     cmd = [
         gdre_path,
         "--headless",
-        f"--recover={pck_path}",
-        f"--output-dir={output_dir}",
+        f"--extract={pck_arg}",
+        f"--output={output_arg}",
+        "--include=res://banks/**/*.bank",
     ]
 
     info(f"Running: {' '.join(cmd)}")
@@ -494,31 +578,39 @@ def find_sfx_bank(extraction_dir: Path) -> Optional[Path]:
 # Step 6: List subsongs in the .bank file using vgmstream
 # ---------------------------------------------------------------------------
 
-# Regex to parse vgmstream's subsong listing output.
-# vgmstream-cli with -l (or just running it on a .bank) prints info like:
-#   "name: sts2_sfx_VO_merchant_hello  stream #: 42"
-# or similar. The exact format varies by version, so we use a flexible regex.
-# We also handle the case where vgmstream prints a table with subsong names.
+# Regex to parse vgmstream's subsong metadata output.
+# `vgmstream-cli -s 1 -S 0 -m <bank>` dumps metadata for every subsong (from
+# subsong 1 through the last one, since -S 0 means "all"), one block per
+# subsong, each block containing lines like:
+#   stream index: 603
+#   stream name: sts2_sfx_VO_merchant_welcome_v1_rr1
+# (verified against vgmstream r2117 output on StS2's real sfx.bank)
+
+_SUBSONG_BLOCK_RE = re.compile(
+    r"stream index:\s*(\d+).*?stream name:\s*(\S+)", re.IGNORECASE | re.DOTALL
+)
+
 
 def list_subsongs(vgmstream_path: str, bank_path: Path) -> List[Tuple[int, str]]:
     """
     List all subsongs in a .bank file using vgmstream-cli.
 
     FMOD .bank files contain multiple "subsongs" — individual audio clips.
-    vgmstream can list them and their names. We need to find the ones
-    related to the merchant.
+    vgmstream-cli has no dedicated "list" flag; instead we ask it to print
+    metadata only (-m) for the full subsong range (-s 1 -S 0, where 0 means
+    "through the last subsong") and parse the per-subsong blocks it prints.
 
     The subsong naming convention for StS2 is:
-        sts2_sfx_VO_merchant_<action>
-    e.g., sts2_sfx_VO_merchant_greeting, sts2_sfx_VO_merchant_purchase, etc.
+        sts2_sfx_VO_merchant_<action>_v<n>_rr<n>
+    e.g. sts2_sfx_VO_merchant_welcome_v1_rr1, sts2_sfx_VO_merchant_laughter_v1_rr2.
+    (There are also "reverse_merchant" variants, which also contain "merchant"
+    and are picked up by the same filter.)
 
     Returns a list of (subsong_index, subsong_name) tuples.
     """
     step("Listing subsongs in sfx.bank with vgmstream...")
 
-    # vgmstream-cli -l <file>  lists subsongs
-    # Some versions use -L or --list; we try a few options.
-    cmd = [vgmstream_path, "-l", str(bank_path)]
+    cmd = [vgmstream_path, "-s", "1", "-S", "0", "-m", str(bank_path)]
     info(f"Running: {' '.join(cmd)}")
 
     try:
@@ -540,65 +632,25 @@ def list_subsongs(vgmstream_path: str, bank_path: Path) -> List[Tuple[int, str]]
         error("vgmstream failed to list subsongs and produced no output.")
         return []
 
-    # Parse the output to extract subsong names and indices.
-    # vgmstream's listing format varies by version. Common patterns:
-    #
-    # Pattern 1 (older versions):
-    #   "stream #: 1   name: sts2_sfx_VO_merchant_greeting"
-    #
-    # Pattern 2 (newer versions with -l):
-    #   "  1: sts2_sfx_VO_merchant_greeting"
-    #
-    # Pattern 3 (metadata mode):
-    #   "subsong 1: sts2_sfx_VO_merchant_greeting"
-    #
-    # We use multiple regex patterns and collect all matches.
-
     subsongs: List[Tuple[int, str]] = []
-
-    # Pattern 1: "stream #: <n> ... name: <name>"
-    for m in re.finditer(r"stream\s*#:\s*(\d+).*?name:\s*(\S+)", output, re.IGNORECASE):
-        idx = int(m.group(1))
-        name = m.group(2).strip().strip('"').strip("'")
-        subsongs.append((idx, name))
-
-    # Pattern 2: "<n>: <name>" (where name contains typical VO chars)
-    if not subsongs:
-        for line in output.splitlines():
-            line = line.strip()
-            # Match lines like "  42: sts2_sfx_VO_merchant_hello"
-            m = re.match(r"(\d+):\s*(sts2_sfx_\S+)", line)
-            if m:
-                idx = int(m.group(1))
-                name = m.group(2).strip().strip('"').strip("'")
-                subsongs.append((idx, name))
-
-    # Pattern 3: "subsong <n>: <name>"
-    if not subsongs:
-        for m in re.finditer(r"subsong\s+(\d+):\s*(\S+)", output, re.IGNORECASE):
+    # Split on the metadata header line so each chunk contains exactly one
+    # subsong's "stream index:" / "stream name:" pair — this avoids the
+    # regex accidentally spanning across subsong boundaries with DOTALL.
+    for block in re.split(r"(?=metadata for )", output):
+        m = _SUBSONG_BLOCK_RE.search(block)
+        if m:
             idx = int(m.group(1))
             name = m.group(2).strip().strip('"').strip("'")
             subsongs.append((idx, name))
 
-    # Pattern 4: broader — look for any line containing "sts2" and a number
     if not subsongs:
-        for line in output.splitlines():
-            # Find a number followed by something that looks like a subsong name
-            m = re.search(r"(\d+).*?(sts2_\S+)", line)
-            if m:
-                idx = int(m.group(1))
-                name = m.group(2).strip().strip('"').strip("'")
-                subsongs.append((idx, name))
-
-    if not subsongs:
-        # If we still haven't found anything, dump the raw output for debugging
         error("Could not parse subsong listing from vgmstream output.")
         error("Raw vgmstream output (first 2000 chars):")
         error(output[:2000])
         error("")
         error("This may indicate a different vgmstream version or .bank format.")
         error("You can try running vgmstream manually to inspect the bank:")
-        error(f'  "{vgmstream_path}" -l "{bank_path}"')
+        error(f'  "{vgmstream_path}" -s 1 -S 0 -m "{bank_path}"')
         return []
 
     # De-duplicate by subsong index (keep first occurrence)
@@ -617,12 +669,20 @@ def list_subsongs(vgmstream_path: str, bank_path: Path) -> List[Tuple[int, str]]
 # Step 7: Filter for merchant voice lines
 # ---------------------------------------------------------------------------
 
-def filter_merchant_subsongs(subsongs: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+def filter_merchant_subsongs(
+    subsongs: List[Tuple[int, str]],
+    exclude_reverse: bool = False,
+) -> List[Tuple[int, str]]:
     """
     Filter the subsong list to only include merchant voice lines.
 
     Merchant voice events are named like:
-        sts2_sfx_VO_merchant_<action>
+        sts2_sfx_VO_merchant_<action>_v<n>_rr<n>
+
+    There are also "reverse_merchant" variants (sts2_sfx_VO_reverse_merchant_*)
+    — real backwards-played clips used for specific in-game moments (die, hehe,
+    hurt_sad). They also contain "merchant" and are included by default; pass
+    exclude_reverse=True to only keep the forward-playing lines.
 
     We match case-insensitively on "merchant" in the subsong name.
     """
@@ -630,6 +690,7 @@ def filter_merchant_subsongs(subsongs: List[Tuple[int, str]]) -> List[Tuple[int,
         (idx, name)
         for idx, name in subsongs
         if "merchant" in name.lower()
+        and not (exclude_reverse and "reverse" in name.lower())
     ]
 
     if not merchant_subsongs:
@@ -841,6 +902,21 @@ def main() -> int:
              "the .pck and just want to re-run the audio extraction. "
              "Requires --extraction-dir to point to the existing extraction.",
     )
+    parser.add_argument(
+        "--sounds-dir",
+        type=str,
+        default="sounds",
+        help="Directory to copy sequentially-numbered, soundboard-ready files "
+             "into (merchant_01.mp3, merchant_02.mp3, ...) — a simple, generic "
+             "naming scheme for downstream consumers. Set to an empty string "
+             "to skip this step. (default: sounds)",
+    )
+    parser.add_argument(
+        "--exclude-reverse-lines",
+        action="store_true",
+        help="Skip the 'reverse_merchant' clips (backwards-played die/hehe/hurt_sad "
+             "sounds) and only extract forward-playing merchant lines.",
+    )
     args = parser.parse_args()
 
     # -------------------------------------------------------------------
@@ -856,7 +932,7 @@ def main() -> int:
             warn("GDRE Tools not found, but --skip-extraction was specified. Continuing.")
         else:
             error("GDRE Tools (gdre_tools) was not found on your system or PATH.")
-            error("Please install it from: https://github.com/bruvzg/gdsdecomp/releases")
+            error("Please install it from: https://github.com/GDRETools/gdsdecomp/releases")
             error("Or specify its path with --gdre-path")
             error("If you've already extracted the .pck, use --skip-extraction with --extraction-dir")
             return 1
@@ -949,7 +1025,9 @@ def main() -> int:
         error("No subsongs could be listed from sfx.bank.")
         return 1
 
-    merchant_subsongs = filter_merchant_subsongs(all_subsongs)
+    merchant_subsongs = filter_merchant_subsongs(
+        all_subsongs, exclude_reverse=args.exclude_reverse_lines
+    )
 
     if not merchant_subsongs:
         error("No merchant voice lines were found in the sound bank.")
@@ -959,39 +1037,65 @@ def main() -> int:
         error("  3. The merchant voice lines haven't been added to the game yet.")
         error("")
         error("Try running vgmstream manually to inspect the bank:")
-        error(f'  "{vgmstream}" -l "{sfx_bank}"')
+        error(f'  "{vgmstream}" -s 1 -S 0 -m "{sfx_bank}"')
         error("And look for any subsong names containing 'merchant' or 'VO'.")
         return 1
+
+    # Sort by internal name for a stable, human-friendly numbering — forward
+    # "merchant_*" lines sort before "reverse_merchant_*" ones this way.
+    merchant_subsongs = sorted(merchant_subsongs, key=lambda t: t[1])
 
     # -------------------------------------------------------------------
     # Step 6: Decode and convert merchant subsongs
     # -------------------------------------------------------------------
     step(f"Decoding {len(merchant_subsongs)} merchant voice line(s)...")
 
+    sounds_dir: Optional[Path] = None
+    if args.sounds_dir:
+        sounds_dir = Path(args.sounds_dir).resolve()
+        sounds_dir.mkdir(parents=True, exist_ok=True)
+
     decoded_wavs: List[Path] = []
     converted_mp3s: List[Path] = []
+    soundboard_files: List[Path] = []
 
-    for idx, name in merchant_subsongs:
+    for seq, (idx, name) in enumerate(merchant_subsongs, start=1):
         info(f"\n  Processing: {name} (subsong #{idx})")
 
-        # Decode to .wav
+        # Decode to .wav, keeping the descriptive internal name in
+        # output_dir so it's easy to tell which line is which.
         wav_path = decode_subsong(vgmstream, sfx_bank, idx, output_dir, name)
-        if wav_path:
-            decoded_wavs.append(wav_path)
-
-            # Convert to .mp3 if ffmpeg is available
-            if ffmpeg:
-                mp3_path = convert_to_mp3(ffmpeg, wav_path)
-                if mp3_path:
-                    converted_mp3s.append(mp3_path)
-                    # Remove the .wav unless the user asked to keep it
-                    if not args.keep_wav:
-                        try:
-                            wav_path.unlink()
-                        except Exception:
-                            pass  # Non-critical if deletion fails
-        else:
+        if not wav_path:
             warn(f"  Failed to decode subsong #{idx} ({name})")
+            continue
+
+        decoded_wavs.append(wav_path)
+
+        # Convert to .mp3 if ffmpeg is available
+        final_path = wav_path
+        if ffmpeg:
+            mp3_path = convert_to_mp3(ffmpeg, wav_path)
+            if mp3_path:
+                converted_mp3s.append(mp3_path)
+                final_path = mp3_path
+                # Remove the .wav unless the user asked to keep it
+                if not args.keep_wav:
+                    try:
+                        wav_path.unlink()
+                    except Exception:
+                        pass  # Non-critical if deletion fails
+
+        # Also copy a sequentially-numbered file into sounds_dir — a simple,
+        # generic naming scheme (sounds/merchant_01.mp3, merchant_02.mp3, ...)
+        # for whatever downstream project consumes these files.
+        if sounds_dir:
+            board_name = f"merchant_{seq:02d}{final_path.suffix}"
+            board_path = sounds_dir / board_name
+            try:
+                shutil.copyfile(final_path, board_path)
+                soundboard_files.append(board_path)
+            except Exception as e:
+                warn(f"  Could not copy {final_path.name} to {board_path}: {e}")
 
     # -------------------------------------------------------------------
     # Summary
@@ -1008,6 +1112,8 @@ def main() -> int:
         print(f"  Converted to .mp3          : 0 (ffmpeg not available)")
     print()
     print(f"  Output directory: {output_dir}")
+    if sounds_dir:
+        print(f"  Sounds directory: {sounds_dir}  ({len(soundboard_files)} files)")
     print()
 
     if decoded_wavs or converted_mp3s:
@@ -1025,6 +1131,18 @@ def main() -> int:
 
         print()
         success("Done! Your merchant voice files are ready to use.")
+        if sounds_dir and soundboard_files:
+            print()
+            success(
+                f"{len(soundboard_files)} sequentially-numbered file(s) copied to "
+                f"{sounds_dir} for downstream use."
+            )
+            if len(soundboard_files) > 12:
+                warn(
+                    f"Note: {len(soundboard_files)} files were produced — if your "
+                    f"downstream app hardcodes an expected clip count, make sure "
+                    f"it's updated to match."
+                )
         if not ffmpeg:
             print()
             warn("Install ffmpeg to also get .mp3 versions (smaller, more compatible).")

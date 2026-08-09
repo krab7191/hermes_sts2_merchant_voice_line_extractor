@@ -21,3 +21,5 @@ __pycache__/
 
 # Debug screenshots
 debug_*.png
+settings.local.json
+sts2_extraction/*
